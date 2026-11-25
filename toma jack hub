@@ -1,0 +1,2247 @@
+--[[
+    TOMAJACK HUB - Interface futurista própria (sem Rayfield)
+    - Aba MIRA: aim lock no tronco ou na cabeça (FOV, suavidade, team check, wall check)
+    - Aba VISUAL: chams (jogadores pintados) + barra de vida
+    - Aba ESP: caixa, nome, vida e distância
+    - Aba CÉU: vários céus (galáxia, nebulosa, aurora...) | Aba CROSSHAIR: miras com ID
+    - Aba EXTRA: shader realista + fumaça colorida ao atirar + FOV da câmera (até 120) + esticar tela + anti lag
+    - Atalhos: H = liga/desliga aim | RightShift = esconde/mostra o menu
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+-- se o hub já estiver aberto (executou de novo), fecha o antigo antes de abrir este
+local env = (getgenv and getgenv()) or _G
+if env.TomajackFechar then
+    pcall(env.TomajackFechar)
+end
+
+local hubFechado = false
+local Conex = {} -- conexões que precisam ser desligadas ao fechar
+
+-- ================= CONFIG =================
+local Config = {
+    Ligado = false,
+    FOV = 150,
+    Suavidade = 1,
+    TeamCheck = false,     -- em RP todo mundo costuma ser do mesmo time: ligado, ele ignora todos
+    WallCheck = true,
+    SoSegurando = true,
+    MostrarFOV = true,
+    AlvoParte = "Tronco",  -- "Tronco" ou "Cabeça" (parte do corpo que o aim lock mira)
+    AlcanceMax = 10000,    -- distância máxima (studs) para o aimlock pegar alguém
+    FOVDinamico = true,    -- alvos longe aceitam um FOV maior (eles ficam pequenos na tela)
+
+    Chams = false,
+    ChamsCor = Color3.fromRGB(255, 30, 30),
+    ChamsPreenchimento = 0.3,
+    ChamsContorno = true,
+    ChamsAtravesParede = true,
+    ChamsIgnorarTime = true,
+
+    BarraVida = false,
+    AlturaBarra = 1.2,
+    EspDistancia = 1500,
+
+    Esp = false,
+    EspCaixa = true,
+    EspNome = true,
+    EspVidaLado = true,
+    EspDistTexto = true,
+    EspCor = Color3.fromRGB(255, 255, 255),
+    EspNomeCor = Color3.fromRGB(255, 220, 0),
+    EspSoInimigos = true,
+
+    Mira = false,
+    MiraId = 1,
+    MiraCor = Color3.fromRGB(255, 30, 30),
+    MiraTam = 1,
+    MiraImagem = "",       -- ID de imagem do Roblox (opcional, no lugar dos modelos prontos)
+
+    Shader = false,
+    ShaderNivel = 2,       -- 1 = leve | 2 = realista | 3 = ultra (gráfico bem forte)
+    ShaderIntensidade = 1, -- ajuste fino em cima do nível: 0.2 = fraco | 1 = normal | 1.5 = forte
+
+    Fumaca = false,
+    FumacaCor = Color3.fromRGB(255, 0, 200),
+    FumacaArcoIris = false,
+    FumacaQtd = 4,         -- quanta fumaça sai a cada tiro
+
+    CamFOVAtivo = false,
+    CamFOV = 90,           -- campo de visão da câmera (o Roblox aceita até 120)
+
+    Esticar = false,
+    EsticarValor = 0.65, -- menor = mais esticado
+}
+
+-- ================= CÍRCULO DO FOV =================
+local circulo
+if typeof(Drawing) == "table" or typeof(Drawing) == "function" then
+    pcall(function()
+        circulo = Drawing.new("Circle")
+        circulo.Thickness = 1
+        circulo.NumSides = 64
+        circulo.Filled = false
+        circulo.Transparency = 1
+        circulo.Color = Color3.fromRGB(255, 30, 30)
+        circulo.Visible = false
+    end)
+end
+
+local temDrawing = circulo ~= nil
+
+-- ================= CACHE =================
+local infos = {}
+local jogadores = {}
+
+local function atualizarLista()
+    local nova = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            nova[#nova + 1] = p
+        end
+    end
+    jogadores = nova
+end
+
+atualizarLista()
+Conex[#Conex + 1] = Players.PlayerAdded:Connect(atualizarLista)
+Conex[#Conex + 1] = Players.PlayerRemoving:Connect(function() task.defer(atualizarLista) end)
+
+local function getInfo(p)
+    local char = p.Character
+    if not char then
+        return nil
+    end
+
+    local info = infos[p]
+    if not info then
+        info = { proxCheck = 0 }
+        infos[p] = info
+    end
+
+    if info.char ~= char then
+        info.char = char
+        info.hum = nil
+        info.cabeca = nil
+        info.tronco = nil
+        info.pctInt = nil
+        info.proxCheck = 0
+    end
+
+    local invalido = not info.tronco or not info.cabeca
+        or not info.tronco.Parent or not info.cabeca.Parent
+    if invalido and os.clock() >= info.proxCheck then
+        info.proxCheck = os.clock() + 0.5
+        info.hum = char:FindFirstChildOfClass("Humanoid")
+        info.tronco = char:FindFirstChild("UpperTorso")
+            or char:FindFirstChild("Torso")
+            or char:FindFirstChild("HumanoidRootPart")
+            or char.PrimaryPart
+            or char:FindFirstChildWhichIsA("BasePart")
+        -- personagens custom de RP: se não tiver "Head", mira no tronco
+        info.cabeca = char:FindFirstChild("Head") or info.tronco
+    end
+
+    return info
+end
+
+-- ================= RAYCAST (reutilizado) =================
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+-- Vê se há parede entre a câmera e a parte. Partes transparentes ou sem colisão
+-- (vidro, grades, efeitos, hitboxes invisíveis) são ignoradas, porque de longe
+-- elas costumavam bloquear o aimlock sem ser uma parede de verdade.
+local function temVisao(parte, char)
+    if not Config.WallCheck then return true end
+
+    local meuChar = player.Character
+    local filtro = meuChar and { meuChar } or {}
+
+    local origem = camera.CFrame.Position
+    local direcao = parte.Position - origem
+
+    for _ = 1, 5 do
+        rayParams.FilterDescendantsInstances = filtro
+        local r = Workspace:Raycast(origem, direcao, rayParams)
+        if not r then return true end
+
+        local alvo = r.Instance
+        if alvo:IsDescendantOf(char) then return true end
+
+        local pai = alvo.Parent
+        local ehPessoa = pai and (pai:FindFirstChildOfClass("Humanoid")
+            or (pai.Parent and pai.Parent:FindFirstChildOfClass("Humanoid")))
+        if ehPessoa or alvo.Transparency >= 0.9 or not alvo.CanCollide then
+            filtro[#filtro + 1] = alvo -- não é parede: ignora e continua
+        else
+            return false
+        end
+    end
+    return false
+end
+
+-- ================= AIM LOCK =================
+local bloqueados = {}
+
+local function acharAlvo()
+    local centro = UserInputService:GetMouseLocation()
+    local camPos = camera.CFrame.Position
+    table.clear(bloqueados)
+
+    for _ = 1, 4 do
+        local melhorParte, melhorChar
+        local melhorNota = 1 -- nota = distância até a mira / FOV permitido (menor é melhor, 1 = borda)
+
+        for _, outro in ipairs(jogadores) do
+            local info = getInfo(outro)
+            -- parte que vai ser mirada: cabeça ou tronco
+            local parte = info and ((Config.AlvoParte == "Cabeça" and info.cabeca) or info.tronco)
+            if info and parte and parte.Parent
+                and (not info.hum or info.hum.Health > 0)
+                and not bloqueados[parte]
+                and not (Config.TeamCheck and outro.Team ~= nil and outro.Team == player.Team)
+            then
+                local distMundo = (parte.Position - camPos).Magnitude
+                if distMundo <= Config.AlcanceMax then
+                    local pos, naTela = camera:WorldToViewportPoint(parte.Position)
+                    if naTela and pos.Z > 0 then
+                        -- quem está longe fica pequeno na tela: aceita um FOV até 2x maior
+                        local limite = Config.FOV
+                        if Config.FOVDinamico then
+                            limite = limite * (1 + math.min(distMundo / 400, 1))
+                        end
+
+                        local dx, dy = pos.X - centro.X, pos.Y - centro.Y
+                        local nota = math.sqrt(dx * dx + dy * dy) / limite
+                        if nota < melhorNota then
+                            melhorNota = nota
+                            melhorParte = parte
+                            melhorChar = info.char
+                        end
+                    end
+                end
+            end
+        end
+
+        if not melhorParte then
+            return nil
+        end
+        if temVisao(melhorParte, melhorChar) then
+            return melhorParte
+        end
+        bloqueados[melhorParte] = true
+    end
+
+    return nil
+end
+
+local PRIORIDADE_AIM = Enum.RenderPriority.Camera.Value + 1
+local PRIORIDADE_ESTICAR = Enum.RenderPriority.Camera.Value + 2
+local PRIORIDADE_VIDA = Enum.RenderPriority.Camera.Value + 3
+
+local circuloVisivel = false
+
+RunService:BindToRenderStep("AimLockTronco", Enum.RenderPriority.Last.Value, function()
+    camera = Workspace.CurrentCamera
+
+    if circulo then
+        local mostrar = Config.Ligado and Config.MostrarFOV
+        if mostrar then
+            circulo.Radius = Config.FOV
+            circulo.Position = UserInputService:GetMouseLocation()
+            circulo.Visible = true
+            circuloVisivel = true
+        elseif circuloVisivel then
+            circulo.Visible = false
+            circuloVisivel = false
+        end
+    end
+
+    if not Config.Ligado then return end
+
+    if Config.SoSegurando and not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+        return
+    end
+
+    local alvo = acharAlvo()
+    if alvo then
+        local alvoCFrame = CFrame.new(camera.CFrame.Position, alvo.Position)
+        camera.CFrame = camera.CFrame:Lerp(alvoCFrame, Config.Suavidade)
+    end
+end)
+
+-- ================= CHAMS (JOGADORES PINTADOS) =================
+local chamsPasta = Instance.new("Folder")
+chamsPasta.Name = "TomajackChams"
+do
+    local ok = pcall(function()
+        chamsPasta.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not ok or not chamsPasta.Parent then
+        chamsPasta.Parent = player:WaitForChild("PlayerGui")
+    end
+end
+
+local chams = {}
+
+local function esconderChams(p)
+    local h = chams[p]
+    if h then
+        h.Enabled = false
+    end
+end
+
+local function removerChams(p)
+    local h = chams[p]
+    if h then
+        pcall(function() h:Destroy() end)
+        chams[p] = nil
+    end
+end
+
+local function atualizarChams(p)
+    local char = p.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+    local deveMostrar = Config.Chams
+        and char ~= nil
+        and char.Parent ~= nil
+        and hum ~= nil
+        and hum.Health > 0
+        and not (Config.ChamsIgnorarTime and p.Team ~= nil and p.Team == player.Team)
+
+    if not deveMostrar then
+        esconderChams(p)
+        return
+    end
+
+    local h = chams[p]
+    if not h or not h.Parent then
+        h = Instance.new("Highlight")
+        h.Name = "Chams_" .. p.Name
+        h.Parent = chamsPasta
+        chams[p] = h
+    end
+
+    if h.Adornee ~= char then
+        h.Adornee = char
+    end
+
+    h.FillColor = Config.ChamsCor
+    h.OutlineColor = Config.ChamsCor
+    h.FillTransparency = Config.ChamsPreenchimento
+    h.OutlineTransparency = Config.ChamsContorno and 0 or 1
+    h.DepthMode = Config.ChamsAtravesParede
+        and Enum.HighlightDepthMode.AlwaysOnTop
+        or Enum.HighlightDepthMode.Occluded
+    h.Enabled = true
+end
+
+Conex[#Conex + 1] = Players.PlayerRemoving:Connect(function(p)
+    removerChams(p)
+    local info = infos[p]
+    if info then
+        if info.barraBorda then pcall(function() info.barraBorda:Remove() end) end
+        if info.barraVida then pcall(function() info.barraVida:Remove() end) end
+        if info.esp then
+            for _, d in pairs(info.esp) do
+                pcall(function() d:Remove() end)
+            end
+        end
+    end
+    infos[p] = nil
+    task.defer(atualizarLista)
+end)
+
+local chamsEstavaLigado = false
+task.spawn(function()
+    while not hubFechado do
+        if Config.Chams then
+            chamsEstavaLigado = true
+            for _, outro in ipairs(jogadores) do
+                pcall(atualizarChams, outro)
+            end
+        elseif chamsEstavaLigado then
+            for p in pairs(chams) do
+                esconderChams(p)
+            end
+            chamsEstavaLigado = false
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- ================= BARRA DE VIDA EM CIMA DO NOME =================
+local function novoQuadrado()
+    local q = Drawing.new("Square")
+    q.Filled = true
+    q.Thickness = 1
+    q.Transparency = 1
+    q.Visible = false
+    return q
+end
+
+local function esconderBarra(info)
+    if info.barraVisivel then
+        info.barraBorda.Visible = false
+        info.barraVida.Visible = false
+        info.barraVisivel = false
+    end
+end
+
+local function paraTela(posicao)
+    local ponto = camera:WorldToViewportPoint(posicao)
+    if ponto.Z <= 0 then
+        return nil
+    end
+    return Vector2.new(ponto.X, ponto.Y)
+end
+
+local function desenharBarra(outro, camPos)
+    local info = getInfo(outro)
+    if not info then
+        local antigo = infos[outro]
+        if antigo then esconderBarra(antigo) end
+        return
+    end
+
+    local hum, cabeca, tronco = info.hum, info.cabeca, info.tronco
+    if not (hum and cabeca and tronco and cabeca.Parent and tronco.Parent)
+        or hum.Health <= 0
+        or (Config.ChamsIgnorarTime and outro.Team ~= nil and outro.Team == player.Team)
+        or (tronco.Position - camPos).Magnitude > Config.EspDistancia
+    then
+        esconderBarra(info)
+        return
+    end
+
+    local topo = cabeca.Position + Vector3.new(0, Config.AlturaBarra, 0)
+    local p1 = paraTela(topo)
+    local p2 = paraTela(topo - Vector3.new(0, 1, 0))
+    if not p1 or not p2 then
+        esconderBarra(info)
+        return
+    end
+
+    if not info.barraBorda then
+        info.barraBorda = novoQuadrado()
+        info.barraBorda.Color = Color3.fromRGB(0, 0, 0)
+        info.barraBorda.Transparency = 0.6
+        info.barraVida = novoQuadrado()
+    end
+
+    local pixelsPorStud = math.abs(p2.Y - p1.Y)
+    local largura = math.clamp(pixelsPorStud * 3, 24, 120)
+    local altura = math.clamp(pixelsPorStud * 0.35, 3, 8)
+    local x = p1.X - largura / 2
+    local y = p1.Y - altura / 2
+
+    local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+
+    info.barraBorda.Position = Vector2.new(x - 1, y - 1)
+    info.barraBorda.Size = Vector2.new(largura + 2, altura + 2)
+
+    info.barraVida.Position = Vector2.new(x, y)
+    info.barraVida.Size = Vector2.new(largura * pct, altura)
+    if info.ultimoPct ~= pct then
+        info.ultimoPct = pct
+        info.barraVida.Color = Color3.fromRGB(255, 0, 0):Lerp(Color3.fromRGB(0, 255, 0), pct)
+    end
+
+    info.barraBorda.Visible = true
+    info.barraVida.Visible = true
+    info.barraVisivel = true
+end
+
+local barraEstavaLigada = false
+
+RunService:BindToRenderStep("VidaTomajack", PRIORIDADE_VIDA, function()
+    if not temDrawing then return end
+
+    if not Config.BarraVida then
+        if barraEstavaLigada then
+            for _, info in pairs(infos) do
+                esconderBarra(info)
+            end
+            barraEstavaLigada = false
+        end
+        return
+    end
+    barraEstavaLigada = true
+
+    camera = Workspace.CurrentCamera
+    local camPos = camera.CFrame.Position
+
+    for _, outro in ipairs(jogadores) do
+        local ok = pcall(desenharBarra, outro, camPos)
+        if not ok then
+            local info = infos[outro]
+            if info then pcall(esconderBarra, info) end
+        end
+    end
+end)
+
+-- ================= ESP (CAIXA, NOME, VIDA E DISTÂNCIA) =================
+local PRETO = Color3.fromRGB(0, 0, 0)
+
+local function novoTextoEsp(tamanho)
+    local t = Drawing.new("Text")
+    t.Size = tamanho
+    t.Center = true
+    t.Outline = true
+    t.Transparency = 1
+    t.Visible = false
+    return t
+end
+
+local function novoQuadradoEsp(preenchido, espessura, cor)
+    local q = Drawing.new("Square")
+    q.Filled = preenchido
+    q.Thickness = espessura
+    q.Color = cor
+    q.Transparency = 1
+    q.Visible = false
+    return q
+end
+
+local function criarEsp(info)
+    info.esp = {
+        sombra = novoQuadradoEsp(false, 3, PRETO),
+        caixa = novoQuadradoEsp(false, 1, Color3.new(1, 1, 1)),
+        nome = novoTextoEsp(14),
+        dist = novoTextoEsp(13),
+        vidaFundo = novoQuadradoEsp(true, 1, PRETO),
+        vidaBarra = novoQuadradoEsp(true, 1, Color3.new(0, 1, 0)),
+        vidaTexto = novoTextoEsp(12),
+    }
+    return info.esp
+end
+
+local function esconderEsp(info)
+    if info.esp and info.espVisivel then
+        for _, d in pairs(info.esp) do
+            d.Visible = false
+        end
+        info.espVisivel = false
+    end
+end
+
+local function desenharEsp(outro, camPos)
+    local info = getInfo(outro)
+    if not info then
+        local antigo = infos[outro]
+        if antigo then esconderEsp(antigo) end
+        return
+    end
+
+    local hum, cabeca, tronco = info.hum, info.cabeca, info.tronco
+    if not (hum and cabeca and tronco and cabeca.Parent and tronco.Parent)
+        or hum.Health <= 0
+        or (Config.EspSoInimigos and outro.Team ~= nil and outro.Team == player.Team)
+        or (tronco.Position - camPos).Magnitude > Config.EspDistancia
+    then
+        esconderEsp(info)
+        return
+    end
+
+    local raiz = info.raiz
+    if not raiz or not raiz.Parent or info.raizChar ~= info.char then
+        raiz = info.char:FindFirstChild("HumanoidRootPart") or tronco
+        info.raiz = raiz
+        info.raizChar = info.char
+    end
+
+    local topo = paraTela(cabeca.Position + Vector3.new(0, cabeca.Size.Y / 2 + 0.2, 0))
+    local base = paraTela(raiz.Position - Vector3.new(0, 3, 0))
+    if not topo or not base or base.Y - topo.Y < 4 then
+        esconderEsp(info)
+        return
+    end
+
+    local esp = info.esp or criarEsp(info)
+
+    local altura = base.Y - topo.Y
+    local largura = altura * 0.6
+    local cx = topo.X
+    local x, y = cx - largura / 2, topo.Y
+    local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+    local corVida = Color3.fromRGB(255, 0, 0):Lerp(Color3.fromRGB(0, 255, 0), pct)
+
+    local mostrarCaixa = Config.EspCaixa
+    esp.sombra.Visible = mostrarCaixa
+    esp.caixa.Visible = mostrarCaixa
+    if mostrarCaixa then
+        esp.sombra.Position = Vector2.new(x, y)
+        esp.sombra.Size = Vector2.new(largura, altura)
+        esp.caixa.Position = Vector2.new(x, y)
+        esp.caixa.Size = Vector2.new(largura, altura)
+        esp.caixa.Color = Config.EspCor
+    end
+
+    esp.nome.Visible = Config.EspNome
+    if Config.EspNome then
+        esp.nome.Text = outro.DisplayName
+        esp.nome.Color = Config.EspNomeCor
+        esp.nome.Position = Vector2.new(cx, y - 17)
+    end
+
+    local mostrarVida = Config.EspVidaLado
+    esp.vidaFundo.Visible = mostrarVida
+    esp.vidaBarra.Visible = mostrarVida
+    esp.vidaTexto.Visible = mostrarVida
+    if mostrarVida then
+        esp.vidaFundo.Position = Vector2.new(x - 6, y - 1)
+        esp.vidaFundo.Size = Vector2.new(4, altura + 2)
+        esp.vidaBarra.Position = Vector2.new(x - 5, y + altura * (1 - pct))
+        esp.vidaBarra.Size = Vector2.new(2, altura * pct)
+        esp.vidaBarra.Color = corVida
+        esp.vidaTexto.Text = tostring(math.floor(pct * 100 + 0.5))
+        esp.vidaTexto.Color = corVida
+        esp.vidaTexto.Position = Vector2.new(x - 15, y - 7)
+    end
+
+    esp.dist.Visible = Config.EspDistTexto
+    if Config.EspDistTexto then
+        esp.dist.Text = math.floor((raiz.Position - camPos).Magnitude) .. "m"
+        esp.dist.Color = Color3.new(1, 1, 1)
+        esp.dist.Position = Vector2.new(cx, base.Y + 2)
+    end
+
+    info.espVisivel = true
+end
+
+local espEstavaLigado = false
+
+RunService:BindToRenderStep("EspTomajack", PRIORIDADE_VIDA + 1, function()
+    if not temDrawing then return end
+
+    if not Config.Esp then
+        if espEstavaLigado then
+            for _, info in pairs(infos) do
+                esconderEsp(info)
+            end
+            espEstavaLigado = false
+        end
+        return
+    end
+    espEstavaLigado = true
+
+    camera = Workspace.CurrentCamera
+    local camPos = camera.CFrame.Position
+
+    for _, outro in ipairs(jogadores) do
+        local ok = pcall(desenharEsp, outro, camPos)
+        if not ok then
+            local info = infos[outro]
+            if info then pcall(esconderEsp, info) end
+        end
+    end
+end)
+
+-- ================= CAMPO DE VISÃO (FOV DA CÂMERA) =================
+-- Igual ao FOV de jogo de tiro: quanto maior, mais você enxerga dos lados. Vai até 120.
+local camFovOriginal = nil
+
+RunService:BindToRenderStep("CamFovTomajack", Enum.RenderPriority.Camera.Value + 1, function()
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+
+    if Config.CamFOVAtivo then
+        if not camFovOriginal then camFovOriginal = cam.FieldOfView end
+        if cam.FieldOfView ~= Config.CamFOV then
+            cam.FieldOfView = Config.CamFOV
+        end
+    elseif camFovOriginal then
+        cam.FieldOfView = camFovOriginal -- desligou: volta ao FOV de antes
+        camFovOriginal = nil
+    end
+end)
+
+-- ================= ESTICAR TELA =================
+RunService:BindToRenderStep("EsticarTomajack", PRIORIDADE_ESTICAR, function()
+    if not Config.Esticar then return end
+    local cam = Workspace.CurrentCamera
+    local y = Config.EsticarValor
+    cam.CFrame = cam.CFrame * CFrame.new(0, 0, 0, 1, 0, 0, 0, y, 0, 0, 0, 1)
+end)
+
+-- ================= ANTI LAG =================
+-- cria um módulo que aplica propriedades em objetos e depois restaura
+local function criarAntiLag(containers, regras)
+    local salvo = {}
+    local conexoes = {}
+    local ativo = false
+
+    local function aplicar(obj)
+        for _, r in ipairs(regras) do
+            if obj:IsA(r.classe) then
+                local orig = salvo[obj] or {}
+                for k, v in pairs(r.props) do
+                    if orig[k] == nil then
+                        pcall(function() orig[k] = obj[k] end)
+                    end
+                    pcall(function() obj[k] = v end)
+                end
+                salvo[obj] = orig
+            end
+        end
+    end
+
+    return function(ligar)
+        if ligar == ativo then return end
+        ativo = ligar
+
+        if ligar then
+            for _, c in ipairs(containers) do
+                conexoes[#conexoes + 1] = c.DescendantAdded:Connect(function(o)
+                    if ativo then aplicar(o) end
+                end)
+                task.spawn(function()
+                    local n = 0
+                    for _, o in ipairs(c:GetDescendants()) do
+                        if not ativo then return end
+                        aplicar(o)
+                        n += 1
+                        if n % 400 == 0 then task.wait() end -- não trava o jogo
+                    end
+                end)
+            end
+        else
+            for _, cn in ipairs(conexoes) do cn:Disconnect() end
+            table.clear(conexoes)
+            for obj, orig in pairs(salvo) do
+                for k, v in pairs(orig) do
+                    pcall(function() obj[k] = v end)
+                end
+            end
+            table.clear(salvo)
+        end
+    end
+end
+
+local antiLagEfeitos = criarAntiLag({ Lighting }, {
+    { classe = "BlurEffect", props = { Enabled = false } },
+    { classe = "BloomEffect", props = { Enabled = false } },
+    { classe = "SunRaysEffect", props = { Enabled = false } },
+    { classe = "ColorCorrectionEffect", props = { Enabled = false } },
+    { classe = "DepthOfFieldEffect", props = { Enabled = false } },
+})
+
+local antiLagTexturas = criarAntiLag({ Workspace }, {
+    { classe = "BasePart", props = { Material = Enum.Material.SmoothPlastic, Reflectance = 0 } },
+    { classe = "Decal", props = { Transparency = 1 } },
+})
+
+local antiLagParticulas = criarAntiLag({ Workspace }, {
+    { classe = "ParticleEmitter", props = { Enabled = false } },
+    { classe = "Trail", props = { Enabled = false } },
+    { classe = "Smoke", props = { Enabled = false } },
+    { classe = "Fire", props = { Enabled = false } },
+    { classe = "Sparkles", props = { Enabled = false } },
+})
+
+local sombraOriginal = Lighting.GlobalShadows
+local qualidadeOriginal
+pcall(function() qualidadeOriginal = settings().Rendering.QualityLevel end)
+
+local function antiLagSombras(ligar)
+    if ligar then
+        sombraOriginal = Lighting.GlobalShadows
+        Lighting.GlobalShadows = false
+    else
+        Lighting.GlobalShadows = sombraOriginal
+    end
+end
+
+local function antiLagQualidade(ligar)
+    pcall(function()
+        if ligar then
+            qualidadeOriginal = settings().Rendering.QualityLevel
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        elseif qualidadeOriginal then
+            settings().Rendering.QualityLevel = qualidadeOriginal
+        end
+    end)
+end
+
+-- ================= SHADER (REALISTA) =================
+-- Só usa efeitos de pós-processamento do próprio Roblox (baratos). Três níveis:
+--   1 leve      : cor e brilho discretos
+--   2 realista  : + profundidade de campo suave, raios de sol, névoa leve e reflexos
+--   3 ultra     : visual cinematográfico, o mais bonito (e o mais pesado dos três)
+-- Tudo é removido e a iluminação volta ao normal ao desligar.
+-- (O "Future lighting" do Roblox não dá para ligar por script: é uma configuração do jogo.)
+local PRESETS = {
+    [1] = {
+        contraste = 0.08, saturacao = 0.10, brilho = 0,
+        bloom = 0.15, bloomTam = 24, bloomLimite = 0.97,
+        sol = 0.04, nevoa = 0.10, haze = 0.10,
+        exposicao = 0, dof = nil, reflexo = nil, sombra = 0.25,
+    },
+    [2] = {
+        contraste = 0.14, saturacao = 0.18, brilho = 0,
+        bloom = 0.25, bloomTam = 26, bloomLimite = 0.95,
+        sol = 0.08, nevoa = 0.16, haze = 0.15,
+        exposicao = -0.05, dof = { longe = 0.10, foco = 160, raio = 100 }, reflexo = 1, sombra = 0.2,
+    },
+    [3] = {
+        contraste = 0.20, saturacao = 0.26, brilho = -0.01,
+        bloom = 0.35, bloomTam = 32, bloomLimite = 0.92,
+        sol = 0.12, nevoa = 0.22, haze = 0.25,
+        exposicao = -0.08, dof = { longe = 0.22, foco = 120, raio = 70 }, reflexo = 1, sombra = 0.12,
+    },
+}
+
+local shader = { efeitos = nil, original = nil, atmosfera = nil }
+
+local function removerShader()
+    if shader.efeitos then
+        for _, e in pairs(shader.efeitos) do
+            pcall(function() e:Destroy() end)
+        end
+        shader.efeitos = nil
+    end
+    if shader.atmosfera then
+        pcall(function() shader.atmosfera:Destroy() end)
+        shader.atmosfera = nil
+    end
+    if shader.original then
+        for k, v in pairs(shader.original) do
+            pcall(function() Lighting[k] = v end)
+        end
+        shader.original = nil
+    end
+end
+
+local function aplicarShader()
+    local preset = PRESETS[math.clamp(math.floor(Config.ShaderNivel + 0.5), 1, 3)]
+    local i = Config.ShaderIntensidade
+
+    if not shader.efeitos then
+        -- guarda o que vamos mexer na iluminação para devolver depois
+        shader.original = {}
+        for _, k in ipairs({ "ExposureCompensation", "ShadowSoftness", "EnvironmentSpecularScale", "EnvironmentDiffuseScale" }) do
+            pcall(function() shader.original[k] = Lighting[k] end)
+        end
+
+        local function novo(classe, nome)
+            local e = Instance.new(classe)
+            e.Name = nome
+            e.Parent = Lighting
+            return e
+        end
+
+        shader.efeitos = {
+            cor = novo("ColorCorrectionEffect", "TomajackShaderCor"),
+            brilho = novo("BloomEffect", "TomajackShaderBrilho"),
+            sol = novo("SunRaysEffect", "TomajackShaderSol"),
+            dof = novo("DepthOfFieldEffect", "TomajackShaderProfundidade"),
+        }
+
+        -- névoa leve: só se o jogo ainda não tiver uma (para não empilhar)
+        if not Lighting:FindFirstChildOfClass("Atmosphere") then
+            local atm = Instance.new("Atmosphere")
+            atm.Name = "TomajackShaderNevoa"
+            atm.Parent = Lighting
+            shader.atmosfera = atm
+        end
+    end
+
+    local e = shader.efeitos
+
+    -- cor: contraste, saturação e um tom levemente quente
+    e.cor.Contrast = preset.contraste * i
+    e.cor.Saturation = preset.saturacao * i
+    e.cor.Brightness = preset.brilho * i
+    e.cor.TintColor = Color3.fromRGB(250, 245, 240)
+
+    -- brilho suave nas partes claras
+    e.brilho.Intensity = preset.bloom * i
+    e.brilho.Size = preset.bloomTam
+    e.brilho.Threshold = preset.bloomLimite
+
+    -- raios de sol
+    e.sol.Intensity = preset.sol * i
+    e.sol.Spread = 0.75
+
+    -- profundidade de campo: desfoca só o que está bem longe (nível 2 e 3)
+    if preset.dof then
+        e.dof.Enabled = true
+        e.dof.FarIntensity = math.min(preset.dof.longe * i, 0.6)
+        e.dof.FocusDistance = preset.dof.foco
+        e.dof.InFocusRadius = preset.dof.raio
+        e.dof.NearIntensity = 0
+    else
+        e.dof.Enabled = false
+    end
+
+    -- névoa atmosférica
+    if shader.atmosfera then
+        local a = shader.atmosfera
+        a.Density = preset.nevoa * math.min(i, 1.3)
+        a.Offset = 0.2
+        a.Color = Color3.fromRGB(165, 175, 192)
+        a.Decay = Color3.fromRGB(88, 94, 106)
+        a.Glare = 0
+        a.Haze = preset.haze * math.min(i, 1.3)
+    end
+
+    -- iluminação: exposição, sombras suaves e reflexos
+    if shader.original then
+        pcall(function()
+            Lighting.ExposureCompensation = (shader.original.ExposureCompensation or 0) + preset.exposicao * i
+            Lighting.ShadowSoftness = preset.sombra
+            -- só os reflexos (a luz geral não muda, para não esbranquiçar)
+            if preset.reflexo then
+                Lighting.EnvironmentSpecularScale = preset.reflexo
+            else
+                Lighting.EnvironmentSpecularScale = shader.original.EnvironmentSpecularScale or 1
+            end
+        end)
+    end
+end
+
+-- =====================================================================
+-- ======================= INTERFACE FUTURISTA =========================
+-- =====================================================================
+-- (os nomes Ciano/Magenta são antigos: agora são o vermelho e o laranja-sangue)
+local T = {
+    Fundo = Color3.fromRGB(6, 4, 4),
+    Painel = Color3.fromRGB(13, 7, 7),
+    Elemento = Color3.fromRGB(21, 10, 10),
+    Hover = Color3.fromRGB(42, 13, 13),
+    Ciano = Color3.fromRGB(255, 30, 30),
+    Magenta = Color3.fromRGB(255, 95, 0),
+    Texto = Color3.fromRGB(245, 236, 236),
+    Dim = Color3.fromRGB(160, 118, 118),
+    Off = Color3.fromRGB(52, 28, 28),
+    -- fonte das opções (troque aqui: GothamBold, GothamBlack, SourceSansBold, Michroma, Bangers...)
+    Fonte = Enum.Font.GothamBold,
+    TamanhoTexto = 13,
+}
+
+local function criar(classe, props, parent)
+    local obj = Instance.new(classe)
+    for k, v in pairs(props) do
+        obj[k] = v
+    end
+    obj.Parent = parent
+    return obj
+end
+
+local function cantos(obj, px)
+    -- cantos quase retos: o raio pedido vira ~1/3
+    return criar("UICorner", { CornerRadius = UDim.new(0, math.floor((px or 8) * 0.35)) }, obj)
+end
+
+local function borda(obj, cor, transp, espessura)
+    return criar("UIStroke", {
+        Color = cor or T.Ciano,
+        Transparency = transp or 0.5,
+        Thickness = espessura or 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, obj)
+end
+
+local function neon(parent, rotacao)
+    return criar("UIGradient", {
+        Color = ColorSequence.new(T.Ciano, T.Magenta),
+        Rotation = rotacao or 0,
+    }, parent)
+end
+
+local function tw(obj, tempo, props)
+    TweenService:Create(obj, TweenInfo.new(tempo, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+end
+
+local function texto(parent, props)
+    local base = {
+        BackgroundTransparency = 1,
+        Font = T.Fonte,
+        TextSize = T.TamanhoTexto,
+        TextColor3 = T.Texto,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }
+    for k, v in pairs(props) do base[k] = v end
+    return criar("TextLabel", base, parent)
+end
+
+local function ehClique(i)
+    return i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch
+end
+
+local function ehMovimento(i)
+    return i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch
+end
+
+-- arrasta na horizontal e devolve a posição X do mouse/dedo
+local function arrastavel(zona, aoMover)
+    local ativo = false
+    zona.InputBegan:Connect(function(i)
+        if ehClique(i) then
+            ativo = true
+            aoMover(i.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if ativo and ehMovimento(i) then
+            aoMover(i.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if ehClique(i) then ativo = false end
+    end)
+end
+
+-- ---------- janela ----------
+local gui = Instance.new("ScreenGui")
+gui.Name = "TomajackHub"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+do
+    local ok = pcall(function()
+        gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not ok or not gui.Parent then
+        gui.Parent = player:WaitForChild("PlayerGui")
+    end
+end
+
+local main = criar("Frame", {
+    Name = "Main",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(580, 420),
+    BackgroundColor3 = T.Fundo,
+    BackgroundTransparency = 0.04,
+    BorderSizePixel = 0,
+}, gui)
+cantos(main, 12)
+local escala = criar("UIScale", { Scale = 0.92 }, main)
+
+local contornoMain = criar("UIStroke", {
+    Color = Color3.new(1, 1, 1),
+    Thickness = 2,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, main)
+local gradContorno = neon(contornoMain, 0)
+
+-- brilho suave de fundo (degradê escuro)
+criar("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(26, 8, 8), Color3.fromRGB(5, 3, 3)),
+    Rotation = 90,
+}, main)
+
+-- barra do topo
+local topo = criar("Frame", {
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundTransparency = 1,
+}, main)
+
+local titulo = texto(topo, {
+    Position = UDim2.fromOffset(16, 0),
+    Size = UDim2.fromOffset(160, 44),
+    Text = "TOMAJACK",
+    Font = Enum.Font.GothamBlack,
+    TextSize = 20,
+    TextColor3 = Color3.new(1, 1, 1),
+})
+neon(titulo, 0)
+
+texto(topo, {
+    Position = UDim2.fromOffset(130, 2),
+    Size = UDim2.fromOffset(200, 44),
+    Text = "HUB // MODO AGRESSIVO",
+    Font = Enum.Font.Code,
+    TextSize = 12,
+    TextColor3 = T.Dim,
+})
+
+local linhaTopo = criar("Frame", {
+    Position = UDim2.fromOffset(0, 44),
+    Size = UDim2.new(1, 0, 0, 1),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, main)
+neon(linhaTopo, 0)
+
+local botaoMin = criar("TextButton", {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -12, 0, 22),
+    Size = UDim2.fromOffset(28, 24),
+    BackgroundColor3 = T.Elemento,
+    Text = "–",
+    TextSize = 18,
+    Font = Enum.Font.GothamBold,
+    TextColor3 = T.Texto,
+    AutoButtonColor = false,
+}, main)
+cantos(botaoMin, 6)
+borda(botaoMin, T.Magenta, 0.6)
+
+local botaoFechar = criar("TextButton", {
+    AnchorPoint = Vector2.new(1, 0.5),
+    Position = UDim2.new(1, -46, 0, 22),
+    Size = UDim2.fromOffset(28, 24),
+    BackgroundColor3 = T.Elemento,
+    Text = "✕",
+    TextSize = 13,
+    Font = Enum.Font.GothamBold,
+    TextColor3 = Color3.fromRGB(255, 90, 110),
+    AutoButtonColor = false,
+}, main)
+cantos(botaoFechar, 6)
+borda(botaoFechar, Color3.fromRGB(255, 60, 90), 0.6)
+
+-- barra lateral
+local lateral = criar("Frame", {
+    Position = UDim2.fromOffset(10, 54),
+    Size = UDim2.fromOffset(120, 326),
+    BackgroundColor3 = T.Painel,
+    BackgroundTransparency = 0.2,
+    BorderSizePixel = 0,
+}, main)
+cantos(lateral, 10)
+borda(lateral, T.Ciano, 0.85)
+criar("UIListLayout", {
+    Padding = UDim.new(0, 6),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, lateral)
+criar("UIPadding", {
+    PaddingTop = UDim.new(0, 8),
+    PaddingLeft = UDim.new(0, 8),
+    PaddingRight = UDim.new(0, 8),
+}, lateral)
+
+-- área de conteúdo
+local conteudo = criar("Frame", {
+    Position = UDim2.fromOffset(140, 54),
+    Size = UDim2.fromOffset(430, 326),
+    BackgroundTransparency = 1,
+}, main)
+
+-- rodapé
+local rodape = texto(main, {
+    Position = UDim2.fromOffset(16, 388),
+    Size = UDim2.new(1, -32, 0, 24),
+    Text = "[H] aim lock   •   [RightShift] esconder menu",
+    Font = Enum.Font.Code,
+    TextSize = 11,
+    TextColor3 = T.Dim,
+})
+
+-- ---------- notificações ----------
+local notifFrame = criar("Frame", {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -16, 0, 16),
+    Size = UDim2.fromOffset(250, 320),
+    BackgroundTransparency = 1,
+}, gui)
+criar("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    HorizontalAlignment = Enum.HorizontalAlignment.Right,
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, notifFrame)
+
+local function notificar(tituloTxt, corpo, duracao)
+    local item = criar("Frame", {
+        Size = UDim2.fromOffset(250, 52),
+        BackgroundColor3 = T.Painel,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, notifFrame)
+    cantos(item, 8)
+    local s = borda(item, T.Ciano, 1, 1)
+    local barra = criar("Frame", {
+        Size = UDim2.new(0, 3, 1, -12),
+        Position = UDim2.fromOffset(6, 6),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, item)
+    cantos(barra, 2)
+    neon(barra, 90)
+    local l1 = texto(item, {
+        Position = UDim2.fromOffset(18, 6), Size = UDim2.new(1, -26, 0, 18),
+        Text = tituloTxt, Font = Enum.Font.GothamBold, TextSize = 13, TextTransparency = 1,
+    })
+    local l2 = texto(item, {
+        Position = UDim2.fromOffset(18, 26), Size = UDim2.new(1, -26, 0, 18),
+        Text = corpo, TextSize = 12, TextColor3 = T.Dim, TextTransparency = 1,
+    })
+    tw(item, 0.25, { BackgroundTransparency = 0.05 })
+    tw(s, 0.25, { Transparency = 0.5 })
+    tw(barra, 0.25, { BackgroundTransparency = 0 })
+    tw(l1, 0.25, { TextTransparency = 0 })
+    tw(l2, 0.25, { TextTransparency = 0 })
+
+    task.delay(duracao or 3, function()
+        tw(item, 0.3, { BackgroundTransparency = 1 })
+        tw(s, 0.3, { Transparency = 1 })
+        tw(barra, 0.3, { BackgroundTransparency = 1 })
+        tw(l1, 0.3, { TextTransparency = 1 })
+        tw(l2, 0.3, { TextTransparency = 1 })
+        task.wait(0.35)
+        item:Destroy()
+    end)
+end
+
+-- ---------- abas ----------
+local abaAtiva
+local ordemAba = 0
+
+local function novaAba(nome, glifo)
+    ordemAba += 1
+    local aba = {}
+
+    local botao = criar("TextButton", {
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = T.Ciano,
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        LayoutOrder = ordemAba,
+    }, lateral)
+    cantos(botao, 8)
+
+    local marca = criar("Frame", {
+        Position = UDim2.fromOffset(0, 8),
+        Size = UDim2.fromOffset(3, 20),
+        BackgroundColor3 = T.Ciano,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+    }, botao)
+    cantos(marca, 2)
+
+    local rotuloAba = texto(botao, {
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -14, 1, 0),
+        Text = glifo .. "  " .. nome,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = T.Dim,
+    })
+
+    local pagina = criar("ScrollingFrame", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = T.Ciano,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Visible = false,
+    }, conteudo)
+    criar("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, pagina)
+    criar("UIPadding", {
+        PaddingTop = UDim.new(0, 2),
+        PaddingRight = UDim.new(0, 8),
+        PaddingBottom = UDim.new(0, 6),
+    }, pagina)
+
+    aba.botao, aba.marca, aba.rotulo, aba.pagina = botao, marca, rotuloAba, pagina
+
+    local function selecionar()
+        if abaAtiva == aba then return end
+        if abaAtiva then
+            abaAtiva.pagina.Visible = false
+            tw(abaAtiva.marca, 0.2, { BackgroundTransparency = 1 })
+            tw(abaAtiva.botao, 0.2, { BackgroundTransparency = 1 })
+            tw(abaAtiva.rotulo, 0.2, { TextColor3 = T.Dim })
+        end
+        abaAtiva = aba
+        pagina.Visible = true
+        tw(marca, 0.2, { BackgroundTransparency = 0 })
+        tw(botao, 0.2, { BackgroundTransparency = 0.88 })
+        tw(rotuloAba, 0.2, { TextColor3 = T.Texto })
+    end
+    botao.MouseButton1Click:Connect(selecionar)
+    aba.selecionar = selecionar
+
+    local ordemEl = 0
+    local function caixa(altura)
+        ordemEl += 1
+        local f = criar("Frame", {
+            Size = UDim2.new(1, 0, 0, altura),
+            BackgroundColor3 = T.Elemento,
+            BorderSizePixel = 0,
+            LayoutOrder = ordemEl,
+        }, pagina)
+        cantos(f, 8)
+        local s = borda(f, T.Ciano, 0.55)
+        f.MouseEnter:Connect(function()
+            tw(f, 0.15, { BackgroundColor3 = T.Hover })
+            tw(s, 0.15, { Transparency = 0.1 })
+        end)
+        f.MouseLeave:Connect(function()
+            tw(f, 0.15, { BackgroundColor3 = T.Elemento })
+            tw(s, 0.15, { Transparency = 0.55 })
+        end)
+        return f
+    end
+
+    function aba:Secao(nome)
+        ordemEl += 1
+        local l = texto(pagina, {
+            Size = UDim2.new(1, 0, 0, 20),
+            Text = "// " .. string.upper(nome),
+            Font = Enum.Font.Code,
+            TextSize = 12,
+            TextColor3 = T.Ciano,
+            LayoutOrder = ordemEl,
+        })
+        return l
+    end
+
+    function aba:Toggle(nome, inicial, cb)
+        local f = caixa(38)
+        texto(f, {
+            Position = UDim2.fromOffset(12, 0),
+            Size = UDim2.new(1, -70, 1, 0),
+            Text = string.upper(nome),
+        })
+        local sw = criar("Frame", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -12, 0.5, 0),
+            Size = UDim2.fromOffset(40, 20),
+            BackgroundColor3 = T.Off,
+            BorderSizePixel = 0,
+        }, f)
+        cantos(sw, 10)
+        local knob = criar("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = UDim2.new(0, 3, 0.5, 0),
+            Size = UDim2.fromOffset(14, 14),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, sw)
+        cantos(knob, 7)
+
+        local estado = inicial and true or false
+        local function aplicar(animar)
+            local t = animar and 0.18 or 0
+            tw(sw, t, { BackgroundColor3 = estado and T.Ciano or T.Off })
+            tw(knob, t, { Position = estado and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) })
+        end
+        aplicar(false)
+
+        local clique = criar("TextButton", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Text = "",
+        }, f)
+        clique.MouseButton1Click:Connect(function()
+            estado = not estado
+            aplicar(true)
+            cb(estado)
+        end)
+
+        return {
+            Set = function(v)
+                estado = v and true or false
+                aplicar(true)
+            end,
+        }
+    end
+
+    function aba:Slider(nome, minimo, maximo, incremento, inicial, sufixo, cb)
+        local f = caixa(54)
+        texto(f, {
+            Position = UDim2.fromOffset(12, 4),
+            Size = UDim2.new(1, -110, 0, 24),
+            Text = string.upper(nome),
+        })
+        local valorLabel = texto(f, {
+            AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -12, 0, 4),
+            Size = UDim2.fromOffset(100, 24),
+            TextXAlignment = Enum.TextXAlignment.Right,
+            Font = Enum.Font.Code,
+            TextSize = 12,
+            TextColor3 = T.Ciano,
+            Text = "",
+        })
+
+        local trilho = criar("Frame", {
+            Position = UDim2.new(0, 12, 0, 36),
+            Size = UDim2.new(1, -24, 0, 6),
+            BackgroundColor3 = T.Off,
+            BorderSizePixel = 0,
+        }, f)
+        cantos(trilho, 3)
+        local preenche = criar("Frame", {
+            Size = UDim2.fromScale(0, 1),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, trilho)
+        cantos(preenche, 3)
+        neon(preenche, 0)
+        local bola = criar("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0, 0.5),
+            Size = UDim2.fromOffset(12, 12),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, trilho)
+        cantos(bola, 6)
+        borda(bola, T.Ciano, 0.2, 2)
+
+        local valor = inicial
+        local function mostrar()
+            local frac = (valor - minimo) / (maximo - minimo)
+            preenche.Size = UDim2.fromScale(frac, 1)
+            bola.Position = UDim2.fromScale(frac, 0.5)
+            valorLabel.Text = tostring(math.floor(valor * 100 + 0.5) / 100) .. (sufixo or "")
+        end
+        mostrar()
+
+        local zona = criar("TextButton", {
+            Position = UDim2.fromOffset(0, 26),
+            Size = UDim2.new(1, 0, 0, 26),
+            BackgroundTransparency = 1,
+            Text = "",
+        }, f)
+        arrastavel(zona, function(x)
+            local frac = math.clamp((x - trilho.AbsolutePosition.X) / math.max(trilho.AbsoluteSize.X, 1), 0, 1)
+            local v = minimo + frac * (maximo - minimo)
+            v = math.floor(v / incremento + 0.5) * incremento
+            v = math.clamp(v, minimo, maximo)
+            if v ~= valor then
+                valor = v
+                mostrar()
+                cb(valor)
+            end
+        end)
+    end
+
+    -- caixa de texto (ex.: colar um ID)
+    function aba:Entrada(nome, placeholder, cb)
+        local f = caixa(46)
+        texto(f, {
+            Position = UDim2.fromOffset(12, 0),
+            Size = UDim2.new(0.5, -12, 1, 0),
+            Text = string.upper(nome),
+        })
+        local campo = criar("TextBox", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -10, 0.5, 0),
+            Size = UDim2.new(0.5, -16, 0, 28),
+            BackgroundColor3 = T.Fundo,
+            Text = "",
+            PlaceholderText = placeholder or "",
+            PlaceholderColor3 = T.Dim,
+            TextColor3 = T.Texto,
+            Font = T.Fonte,
+            TextSize = 12,
+            ClearTextOnFocus = false,
+        }, f)
+        cantos(campo, 6)
+        borda(campo, T.Ciano, 0.5)
+        campo.FocusLost:Connect(function() cb(campo.Text) end)
+    end
+
+    -- grade de opções com pré-visualização e rótulo (ex.: "ID 3")
+    function aba:Grade(itens, aoEscolher, colunas)
+        colunas = colunas or 4
+        local linhas = math.ceil(#itens / colunas)
+        local f = caixa(linhas * 78 + (linhas - 1) * 6 + 16)
+
+        local area = criar("Frame", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+        }, f)
+        criar("UIPadding", {
+            PaddingTop = UDim.new(0, 8), PaddingLeft = UDim.new(0, 8),
+            PaddingRight = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+        }, area)
+        criar("UIGridLayout", {
+            CellSize = UDim2.new(1 / colunas, -6, 0, 78),
+            CellPadding = UDim2.fromOffset(6, 6),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }, area)
+
+        local celulas = {}
+        local function selecionar(n)
+            for k, c in ipairs(celulas) do
+                c.contorno.Transparency = (k == n) and 0 or 0.7
+                c.contorno.Thickness = (k == n) and 2 or 1
+            end
+            aoEscolher(n)
+        end
+
+        for n, item in ipairs(itens) do
+            local celula = criar("TextButton", {
+                BackgroundColor3 = T.Painel,
+                Text = "",
+                AutoButtonColor = false,
+                LayoutOrder = n,
+            }, area)
+            cantos(celula, 8)
+            local contorno = borda(celula, T.Ciano, 0.7)
+
+            local previa = criar("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0),
+                Position = UDim2.new(0.5, 0, 0, 8),
+                Size = UDim2.fromOffset(40, 40),
+                BackgroundTransparency = 1,
+            }, celula)
+            item.desenhar(previa)
+
+            texto(celula, {
+                Position = UDim2.new(0, 0, 1, -24),
+                Size = UDim2.new(1, 0, 0, 20),
+                Text = item.rotulo,
+                TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Center,
+            })
+
+            celulas[n] = { contorno = contorno }
+            celula.MouseButton1Click:Connect(function() selecionar(n) end)
+        end
+
+        return { Selecionar = selecionar }
+    end
+
+    function aba:Cor(nome, inicial, lista, cb)
+        local f = caixa(86)
+        texto(f, {
+            Position = UDim2.fromOffset(12, 4),
+            Size = UDim2.new(1, -60, 0, 24),
+            Text = string.upper(nome),
+        })
+        local previa = criar("Frame", {
+            AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -12, 0, 9),
+            Size = UDim2.fromOffset(34, 14),
+            BackgroundColor3 = inicial,
+            BorderSizePixel = 0,
+        }, f)
+        cantos(previa, 4)
+        borda(previa, Color3.new(1, 1, 1), 0.6)
+
+        local function aplicar(cor)
+            previa.BackgroundColor3 = cor
+            cb(cor)
+        end
+
+        local fila = criar("Frame", {
+            Position = UDim2.fromOffset(12, 32),
+            Size = UDim2.new(1, -24, 0, 20),
+            BackgroundTransparency = 1,
+        }, f)
+        criar("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            Padding = UDim.new(0, 5),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }, fila)
+        for i, cor in ipairs(lista) do
+            local b = criar("TextButton", {
+                Size = UDim2.fromOffset(30, 20),
+                BackgroundColor3 = cor,
+                Text = "",
+                AutoButtonColor = false,
+                LayoutOrder = i,
+            }, fila)
+            cantos(b, 5)
+            borda(b, Color3.new(1, 1, 1), 0.75)
+            b.MouseButton1Click:Connect(function() aplicar(cor) end)
+        end
+
+        local hue = criar("Frame", {
+            Position = UDim2.new(0, 12, 0, 62),
+            Size = UDim2.new(1, -24, 0, 10),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+        }, f)
+        cantos(hue, 5)
+        criar("UIGradient", {
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromHSV(0, 1, 1)),
+                ColorSequenceKeypoint.new(1 / 6, Color3.fromHSV(1 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(2 / 6, Color3.fromHSV(2 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(3 / 6, Color3.fromHSV(3 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(4 / 6, Color3.fromHSV(4 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(5 / 6, Color3.fromHSV(5 / 6, 1, 1)),
+                ColorSequenceKeypoint.new(1, Color3.fromHSV(1, 1, 1)),
+            }),
+        }, hue)
+        local bolaHue = criar("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0, 0.5),
+            Size = UDim2.fromOffset(6, 16),
+            BackgroundColor3 = Color3.new(1, 1, 1),
+            BorderSizePixel = 0,
+            Visible = false,
+        }, hue)
+        cantos(bolaHue, 3)
+
+        local zona = criar("TextButton", {
+            Position = UDim2.fromOffset(0, 56),
+            Size = UDim2.new(1, 0, 0, 24),
+            BackgroundTransparency = 1,
+            Text = "",
+        }, f)
+        arrastavel(zona, function(x)
+            local frac = math.clamp((x - hue.AbsolutePosition.X) / math.max(hue.AbsoluteSize.X, 1), 0, 1)
+            bolaHue.Visible = true
+            bolaHue.Position = UDim2.fromScale(frac, 0.5)
+            aplicar(Color3.fromHSV(frac, 1, 1))
+        end)
+    end
+
+    if not abaAtiva then selecionar() end
+    return aba
+end
+
+-- ---------- MIRA NA TELA (crosshair) ----------
+-- Desenha o crosshair com formas (sem precisar de imagem) e mostra o "ID" de cada modelo.
+local function formaMira(pai, id, cor)
+    local function barra(x, y, w, h, rot)
+        return criar("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.new(0.5, x, 0.5, y),
+            Size = UDim2.fromOffset(w, h),
+            BackgroundColor3 = cor,
+            BorderSizePixel = 0,
+            Rotation = rot or 0,
+        }, pai)
+    end
+    local function ponto(tam)
+        local f = barra(0, 0, tam, tam)
+        cantos(f, 100)
+        return f
+    end
+    local function anel(tam, grosso, quadrado)
+        local f = criar("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(tam, tam),
+            BackgroundTransparency = 1,
+        }, pai)
+        criar("UIStroke", { Color = cor, Thickness = grosso }, f)
+        if not quadrado then
+            criar("UICorner", { CornerRadius = UDim.new(1, 0) }, f)
+        end
+        return f
+    end
+
+    if id == 1 then
+        ponto(5)
+    elseif id == 2 then
+        barra(0, -9, 2, 8) barra(0, 9, 2, 8) barra(-9, 0, 8, 2) barra(9, 0, 8, 2)
+    elseif id == 3 then
+        barra(0, -13, 1, 12) barra(0, 13, 1, 12) barra(-13, 0, 12, 1) barra(13, 0, 12, 1)
+    elseif id == 4 then
+        anel(22, 2)
+    elseif id == 5 then
+        anel(22, 1.5) ponto(3)
+    elseif id == 6 then
+        barra(0, 0, 2, 26, 45) barra(0, 0, 2, 26, -45)
+    elseif id == 7 then
+        barra(-9, 0, 8, 2) barra(9, 0, 8, 2) barra(0, 9, 2, 8)
+    elseif id == 8 then
+        barra(-5, 2, 14, 2, -35) barra(5, 2, 14, 2, 35)
+    elseif id == 9 then
+        anel(20, 1.5, true)
+    elseif id == 10 then
+        barra(0, -9, 2, 8) barra(0, 9, 2, 8) barra(-9, 0, 8, 2) barra(9, 0, 8, 2) ponto(3)
+    elseif id == 11 then
+        anel(16, 1.5, true).Rotation = 45
+    else
+        anel(28, 1) barra(0, -7, 2, 6) barra(0, 7, 2, 6) barra(-7, 0, 6, 2) barra(7, 0, 6, 2)
+    end
+end
+local TOTAL_MIRAS = 12
+
+local miraGui = Instance.new("ScreenGui")
+miraGui.Name = "TomajackMira"
+miraGui.ResetOnSpawn = false
+miraGui.DisplayOrder = 500
+miraGui.IgnoreGuiInset = true
+do
+    local ok = pcall(function()
+        miraGui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not ok or not miraGui.Parent then
+        miraGui.Parent = player:WaitForChild("PlayerGui")
+    end
+end
+
+local miraBox = criar("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(40, 40),
+    BackgroundTransparency = 1,
+}, miraGui)
+local miraEscala = criar("UIScale", { Scale = 1 }, miraBox)
+
+local function atualizarMira()
+    for _, c in ipairs(miraBox:GetChildren()) do
+        if not c:IsA("UIScale") then c:Destroy() end
+    end
+    miraBox.Visible = Config.Mira
+    miraEscala.Scale = Config.MiraTam
+    if not Config.Mira then return end
+
+    local idImg = tostring(Config.MiraImagem or ""):match("%d+")
+    if idImg then
+        criar("ImageLabel", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(40, 40),
+            BackgroundTransparency = 1,
+            Image = "rbxassetid://" .. idImg,
+        }, miraBox)
+    else
+        formaMira(miraBox, Config.MiraId, Config.MiraCor)
+    end
+end
+atualizarMira()
+
+-- ---------- CÉUS ----------
+-- Troca o clima do jogo: horário, estrelas, cores e névoa. Tudo volta ao normal em "Original".
+local CEUS = {
+    { nome = "Galáxia", hora = 0, estrelas = 5000, topo = Color3.fromRGB(140, 60, 255), base = Color3.fromRGB(30, 10, 90),
+      amb = Color3.fromRGB(60, 40, 110), atm = { Color3.fromRGB(120, 80, 200), Color3.fromRGB(70, 20, 140), 0.35, 0.6 } },
+    { nome = "Nebulosa rosa", hora = 0, estrelas = 4000, topo = Color3.fromRGB(255, 70, 170), base = Color3.fromRGB(60, 10, 80),
+      amb = Color3.fromRGB(90, 40, 100), atm = { Color3.fromRGB(230, 110, 190), Color3.fromRGB(120, 30, 110), 0.35, 0.55 } },
+    { nome = "Espaço", hora = 0, estrelas = 5000, topo = Color3.fromRGB(10, 10, 40), base = Color3.fromRGB(0, 0, 0),
+      amb = Color3.fromRGB(30, 30, 55), atm = false },
+    { nome = "Aurora", hora = 0, estrelas = 3500, topo = Color3.fromRGB(0, 255, 170), base = Color3.fromRGB(10, 40, 60),
+      amb = Color3.fromRGB(30, 80, 90), atm = { Color3.fromRGB(90, 230, 200), Color3.fromRGB(20, 90, 90), 0.3, 0.5 } },
+    { nome = "Noite azul", hora = 23.5, estrelas = 3000, topo = Color3.fromRGB(40, 90, 200), base = Color3.fromRGB(5, 15, 45),
+      amb = Color3.fromRGB(50, 70, 120), atm = { Color3.fromRGB(80, 110, 190), Color3.fromRGB(30, 45, 100), 0.25, 0.3 } },
+    { nome = "Pôr do sol", hora = 17.8, estrelas = 0, topo = Color3.fromRGB(255, 120, 40), base = Color3.fromRGB(120, 30, 60),
+      amb = Color3.fromRGB(150, 100, 90), atm = { Color3.fromRGB(255, 170, 110), Color3.fromRGB(200, 90, 60), 0.3, 0.4 } },
+    { nome = "Amanhecer", hora = 5.9, estrelas = 300, topo = Color3.fromRGB(255, 170, 120), base = Color3.fromRGB(90, 110, 180),
+      amb = Color3.fromRGB(130, 120, 130), atm = { Color3.fromRGB(240, 180, 150), Color3.fromRGB(150, 110, 130), 0.3, 0.35 } },
+    { nome = "Dia claro", hora = 14, estrelas = 0, topo = Color3.fromRGB(120, 180, 255), base = Color3.fromRGB(255, 255, 255),
+      amb = Color3.fromRGB(120, 130, 145), atm = { Color3.fromRGB(190, 215, 255), Color3.fromRGB(120, 140, 170), 0.2, 0.15 } },
+    { nome = "Sangue", hora = 0.5, estrelas = 1500, topo = Color3.fromRGB(255, 20, 20), base = Color3.fromRGB(40, 0, 0),
+      amb = Color3.fromRGB(90, 30, 30), atm = { Color3.fromRGB(200, 40, 40), Color3.fromRGB(90, 10, 10), 0.35, 0.5 } },
+    { nome = "Neon", hora = 0, estrelas = 800, topo = Color3.fromRGB(0, 230, 255), base = Color3.fromRGB(255, 0, 170),
+      amb = Color3.fromRGB(80, 60, 120), atm = { Color3.fromRGB(150, 80, 220), Color3.fromRGB(100, 30, 150), 0.3, 0.45 } },
+}
+
+local ceu = { ativo = false, hora = 0, original = nil, skies = {}, sky = nil, atm = nil, atmCriada = false, atmOrig = nil }
+
+local function restaurarCeu()
+    ceu.ativo = false
+    if ceu.sky then pcall(function() ceu.sky:Destroy() end) ceu.sky = nil end
+    for _, sk in ipairs(ceu.skies) do
+        pcall(function() sk.Parent = Lighting end)
+    end
+    ceu.skies = {}
+    if ceu.atm then
+        if ceu.atmCriada then
+            pcall(function() ceu.atm:Destroy() end)
+        elseif ceu.atmOrig then
+            for k, v in pairs(ceu.atmOrig) do
+                pcall(function() ceu.atm[k] = v end)
+            end
+        end
+    end
+    ceu.atm, ceu.atmCriada, ceu.atmOrig = nil, false, nil
+    if ceu.original then
+        for k, v in pairs(ceu.original) do
+            pcall(function() Lighting[k] = v end)
+        end
+        ceu.original = nil
+    end
+end
+
+local function aplicarCeu(indice)
+    local c = CEUS[indice]
+    if not c then
+        restaurarCeu()
+        return
+    end
+
+    if not ceu.original then
+        ceu.original = {}
+        for _, k in ipairs({ "ClockTime", "Ambient", "OutdoorAmbient", "ColorShift_Top", "ColorShift_Bottom" }) do
+            pcall(function() ceu.original[k] = Lighting[k] end)
+        end
+    end
+
+    -- esconde o céu do jogo (e põe de volta ao restaurar)
+    if not ceu.sky then
+        for _, o in ipairs(Lighting:GetChildren()) do
+            if o:IsA("Sky") then
+                ceu.skies[#ceu.skies + 1] = o
+            end
+        end
+        for _, o in ipairs(ceu.skies) do
+            o.Parent = nil
+        end
+        ceu.sky = Instance.new("Sky")
+        ceu.sky.Name = "TomajackCeu"
+        ceu.sky.Parent = Lighting
+    end
+    ceu.sky.StarCount = c.estrelas
+    ceu.sky.CelestialBodiesShown = true
+    ceu.sky.MoonAngularSize = 14
+    ceu.sky.SunAngularSize = 22
+
+    -- iluminação e horário
+    ceu.hora = c.hora
+    pcall(function()
+        Lighting.ClockTime = c.hora
+        Lighting.ColorShift_Top = c.topo
+        Lighting.ColorShift_Bottom = c.base
+        Lighting.Ambient = c.amb
+        Lighting.OutdoorAmbient = c.amb
+    end)
+
+    -- névoa atmosférica colorida
+    if not ceu.atm then
+        local existente = Lighting:FindFirstChildOfClass("Atmosphere")
+        if existente then
+            ceu.atm = existente
+            ceu.atmOrig = {
+                Density = existente.Density, Offset = existente.Offset, Color = existente.Color,
+                Decay = existente.Decay, Glare = existente.Glare, Haze = existente.Haze,
+            }
+        elseif c.atm then
+            ceu.atm = Instance.new("Atmosphere")
+            ceu.atm.Name = "TomajackCeuNevoa"
+            ceu.atm.Parent = Lighting
+            ceu.atmCriada = true
+        end
+    end
+    if ceu.atm then
+        if c.atm then
+            ceu.atm.Color = c.atm[1]
+            ceu.atm.Decay = c.atm[2]
+            ceu.atm.Density = c.atm[3]
+            ceu.atm.Haze = c.atm[4]
+            ceu.atm.Offset = 0.25
+            ceu.atm.Glare = 0
+        else
+            ceu.atm.Density = 0
+        end
+    end
+    ceu.ativo = true
+end
+
+-- mantém o horário escolhido (alguns jogos ficam mudando a hora)
+task.spawn(function()
+    while not hubFechado do
+        if ceu.ativo then
+            pcall(function() Lighting.ClockTime = ceu.hora end)
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ---------- conteúdo das abas ----------
+local CORES = {
+    Color3.fromRGB(0, 229, 255),   -- ciano
+    Color3.fromRGB(255, 0, 200),   -- magenta
+    Color3.fromRGB(255, 255, 0),   -- amarelo
+    Color3.fromRGB(0, 120, 255),   -- azul
+    Color3.fromRGB(255, 0, 0),     -- vermelho
+    Color3.fromRGB(0, 255, 60),    -- verde
+    Color3.fromRGB(160, 40, 255),  -- roxo
+    Color3.fromRGB(255, 140, 0),   -- laranja
+    Color3.fromRGB(255, 255, 255), -- branco
+}
+
+local abaMira = novaAba("MIRA", "◎")
+local abaVisual = novaAba("VISUAL", "◈")
+local abaEsp = novaAba("ESP", "▣")
+local abaExtra = novaAba("EXTRA", "✦")
+local abaCeu = novaAba("CÉU", "☾")
+local abaMira2 = novaAba("CROSSHAIR", "✛")
+
+-- MIRA
+abaMira:Secao("aim lock")
+local toggleTronco, toggleCabeca
+
+-- liga/desliga o aim lock e mantém só uma das duas opções ligada
+local function aplicarAim(ligado, parte)
+    Config.Ligado = ligado
+    if parte then Config.AlvoParte = parte end
+    toggleTronco.Set(ligado and Config.AlvoParte == "Tronco")
+    toggleCabeca.Set(ligado and Config.AlvoParte == "Cabeça")
+end
+
+toggleTronco = abaMira:Toggle("Aimlock tronco", false, function(v) aplicarAim(v, "Tronco") end)
+toggleCabeca = abaMira:Toggle("Aimlock cabeça", false, function(v) aplicarAim(v, "Cabeça") end)
+abaMira:Toggle("Só travar segurando botão direito", true, function(v) Config.SoSegurando = v end)
+abaMira:Slider("FOV do aimlock (raio)", 30, 500, 5, Config.FOV, " px", function(v) Config.FOV = v end)
+abaMira:Slider("Alcance máximo", 100, 10000, 100, Config.AlcanceMax, " studs", function(v) Config.AlcanceMax = v end)
+abaMira:Toggle("FOV maior para alvos distantes", true, function(v) Config.FOVDinamico = v end)
+abaMira:Slider("Suavidade (1 = grudado)", 0.05, 1, 0.05, Config.Suavidade, "", function(v) Config.Suavidade = v end)
+abaMira:Secao("filtros")
+abaMira:Toggle("Ignorar meu time", false, function(v) Config.TeamCheck = v end)
+abaMira:Toggle("Não travar através de parede", true, function(v) Config.WallCheck = v end)
+abaMira:Toggle("Mostrar círculo do FOV", true, function(v) Config.MostrarFOV = v end)
+
+-- VISUAL
+abaVisual:Secao("chams")
+abaVisual:Toggle("Chams (pintar jogadores)", false, function(v) Config.Chams = v end)
+abaVisual:Cor("Cor dos chams", Config.ChamsCor, CORES, function(c) Config.ChamsCor = c end)
+abaVisual:Slider("Transparência do preenchimento", 0, 1, 0.05, Config.ChamsPreenchimento, "", function(v) Config.ChamsPreenchimento = v end)
+abaVisual:Toggle("Contorno", true, function(v) Config.ChamsContorno = v end)
+abaVisual:Toggle("Ver através da parede", true, function(v) Config.ChamsAtravesParede = v end)
+abaVisual:Toggle("Ignorar meu time", true, function(v) Config.ChamsIgnorarTime = v end)
+abaVisual:Secao("barra de vida")
+abaVisual:Toggle("Barra de vida em cima do nome", false, function(v)
+    Config.BarraVida = v
+    if v and not temDrawing then
+        notificar("Barra de vida", "Seu executor não tem Drawing.", 4)
+    end
+end)
+abaVisual:Slider("Altura da barra", 0, 4, 0.1, Config.AlturaBarra, "", function(v) Config.AlturaBarra = v end)
+abaVisual:Slider("Distância máxima", 100, 3000, 50, Config.EspDistancia, " studs", function(v) Config.EspDistancia = v end)
+
+-- ESP
+abaEsp:Secao("esp")
+abaEsp:Toggle("ESP", false, function(v)
+    Config.Esp = v
+    if v and not temDrawing then
+        notificar("ESP", "Seu executor não tem Drawing.", 4)
+    end
+end)
+abaEsp:Toggle("Caixa", true, function(v) Config.EspCaixa = v end)
+abaEsp:Toggle("Nome", true, function(v) Config.EspNome = v end)
+abaEsp:Toggle("Vida (barra e número)", true, function(v) Config.EspVidaLado = v end)
+abaEsp:Toggle("Distância", true, function(v) Config.EspDistTexto = v end)
+abaEsp:Toggle("Só inimigos (não mostra meu time)", true, function(v) Config.EspSoInimigos = v end)
+abaEsp:Secao("cores")
+abaEsp:Cor("Cor da caixa", Config.EspCor, CORES, function(c) Config.EspCor = c end)
+abaEsp:Cor("Cor do nome", Config.EspNomeCor, CORES, function(c) Config.EspNomeCor = c end)
+
+-- CÉU
+abaCeu:Secao("escolha o céu")
+do
+    local itens = {
+        {
+            rotulo = "Original",
+            desenhar = function(box)
+                local f = criar("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = T.Off, BorderSizePixel = 0 }, box)
+                cantos(f, 10)
+                texto(f, {
+                    Size = UDim2.fromScale(1, 1), Text = "✕", TextSize = 18,
+                    TextXAlignment = Enum.TextXAlignment.Center, TextColor3 = T.Dim,
+                })
+            end,
+        },
+    }
+    for _, c in ipairs(CEUS) do
+        itens[#itens + 1] = {
+            rotulo = c.nome,
+            desenhar = function(box)
+                local f = criar("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0 }, box)
+                cantos(f, 10)
+                criar("UIGradient", { Color = ColorSequence.new(c.topo, c.base), Rotation = 90 }, f)
+            end,
+        }
+    end
+    abaCeu:Grade(itens, function(n)
+        aplicarCeu(n - 1) -- 1 = Original (restaura)
+    end, 3)
+end
+
+-- CROSSHAIR
+abaMira2:Secao("mira na tela")
+abaMira2:Toggle("Mira customizada", false, function(v)
+    Config.Mira = v
+    atualizarMira()
+end)
+do
+    local itens = {}
+    for n = 1, TOTAL_MIRAS do
+        itens[n] = {
+            rotulo = "ID " .. n,
+            desenhar = function(box) formaMira(box, n, T.Texto) end,
+        }
+    end
+    local grade = abaMira2:Grade(itens, function(n)
+        Config.MiraId = n
+        Config.MiraImagem = ""
+        atualizarMira()
+    end, 4)
+    grade.Selecionar(1)
+end
+abaMira2:Cor("Cor da mira", Config.MiraCor, CORES, function(c)
+    Config.MiraCor = c
+    atualizarMira()
+end)
+abaMira2:Slider("Tamanho da mira", 0.5, 3, 0.1, Config.MiraTam, "x", function(v)
+    Config.MiraTam = v
+    atualizarMira()
+end)
+abaMira2:Secao("imagem própria")
+abaMira2:Entrada("ID de imagem", "ex: 1234567890", function(t)
+    Config.MiraImagem = t
+    atualizarMira()
+end)
+
+-- EXTRA
+abaExtra:Secao("shader")
+abaExtra:Toggle("Shader realista", false, function(v)
+    Config.Shader = v
+    if v then aplicarShader() else removerShader() end
+end)
+abaExtra:Slider("Nível (1 leve / 2 realista / 3 ultra)", 1, 3, 1, Config.ShaderNivel, "", function(v)
+    Config.ShaderNivel = v
+    if Config.Shader then aplicarShader() end
+end)
+abaExtra:Slider("Intensidade do shader", 0.2, 1.5, 0.1, Config.ShaderIntensidade, "", function(v)
+    Config.ShaderIntensidade = v
+    if Config.Shader then aplicarShader() end
+end)
+abaExtra:Secao("fumaça ao atirar")
+abaExtra:Toggle("Fumaça colorida ao atirar", false, function(v) Config.Fumaca = v end)
+abaExtra:Cor("Cor da fumaça", Config.FumacaCor, CORES, function(c)
+    Config.FumacaCor = c
+    Config.FumacaArcoIris = false
+end)
+abaExtra:Toggle("Fumaça arco-íris", false, function(v) Config.FumacaArcoIris = v end)
+abaExtra:Slider("Quantidade de fumaça", 1, 20, 1, Config.FumacaQtd, "", function(v) Config.FumacaQtd = v end)
+abaExtra:Secao("campo de visão (fov da câmera)")
+abaExtra:Toggle("FOV da câmera", false, function(v) Config.CamFOVAtivo = v end)
+abaExtra:Slider("Campo de visão", 40, 120, 1, Config.CamFOV, "°", function(v) Config.CamFOV = v end)
+abaExtra:Secao("esticar tela")
+abaExtra:Toggle("Esticar tela", false, function(v) Config.Esticar = v end)
+abaExtra:Slider("Intensidade (menor = mais esticado)", 0.3, 1, 0.05, Config.EsticarValor, "", function(v)
+    Config.EsticarValor = v
+end)
+abaExtra:Secao("anti lag")
+abaExtra:Toggle("Desligar efeitos (blur, bloom, raios)", false, antiLagEfeitos)
+abaExtra:Toggle("Desligar sombras", false, antiLagSombras)
+abaExtra:Toggle("Texturas simples (material liso)", false, antiLagTexturas)
+abaExtra:Toggle("Desligar partículas, fogo e rastros", false, antiLagParticulas)
+abaExtra:Toggle("Qualidade gráfica mínima", false, antiLagQualidade)
+
+-- ---------- janela: arrastar, esconder, animação ----------
+do
+    local arrastando, inicioDrag, posInicial = false, nil, nil
+    topo.InputBegan:Connect(function(i)
+        if ehClique(i) then
+            arrastando = true
+            inicioDrag = i.Position
+            posInicial = main.Position
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if arrastando and ehMovimento(i) then
+            local d = i.Position - inicioDrag
+            main.Position = UDim2.new(
+                posInicial.X.Scale, posInicial.X.Offset + d.X,
+                posInicial.Y.Scale, posInicial.Y.Offset + d.Y
+            )
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if ehClique(i) then arrastando = false end
+    end)
+end
+
+local menuAberto = true
+local function alternarMenu()
+    menuAberto = not menuAberto
+    if menuAberto then
+        main.Visible = true
+        tw(escala, 0.2, { Scale = 1 })
+    else
+        tw(escala, 0.15, { Scale = 0.92 })
+        task.delay(0.15, function()
+            if not menuAberto then main.Visible = false end
+        end)
+    end
+end
+
+botaoMin.MouseButton1Click:Connect(function()
+    alternarMenu()
+    notificar("Menu escondido", "Aperte RightShift para abrir.", 3)
+end)
+
+Conex[#Conex + 1] = UserInputService.InputBegan:Connect(function(i, processado)
+    if processado then return end
+    if i.KeyCode == Enum.KeyCode.RightShift then
+        alternarMenu()
+    elseif i.KeyCode == Enum.KeyCode.H then
+        aplicarAim(not Config.Ligado)
+        notificar("Aim Lock", Config.Ligado and ("LIGADO (" .. Config.AlvoParte .. ")") or "DESLIGADO", 1.5)
+    end
+end)
+
+-- borda neon girando (só gasta processamento com o menu aberto)
+Conex[#Conex + 1] = RunService.RenderStepped:Connect(function()
+    if menuAberto then
+        gradContorno.Rotation = (os.clock() * 45) % 360
+    end
+end)
+
+-- ---------- FUMAÇA COLORIDA AO ATIRAR ----------
+-- Quando você segura o botão esquerdo com uma arma (Tool) na mão, sai fumaça colorida
+-- da ponta da arma. É só visual: aparece na sua tela.
+local fumacaAtt, fumacaEm, fumacaTool = nil, nil, nil
+local acumuladorFumaca = 0
+
+local function limparFumaca()
+    if fumacaAtt then pcall(function() fumacaAtt:Destroy() end) end
+    fumacaAtt, fumacaEm, fumacaTool = nil, nil, nil
+end
+
+local function pegarEmissor(tool)
+    if fumacaEm and fumacaEm.Parent and fumacaTool == tool then
+        return fumacaEm
+    end
+    limparFumaca()
+
+    local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+    if not handle then return nil end
+
+    local att = Instance.new("Attachment")
+    att.Name = "TomajackFumaca"
+    att.Position = Vector3.new(0, 0, -handle.Size.Z / 2) -- ponta da arma (frente = -Z)
+    att.Parent = handle
+
+    local em = Instance.new("ParticleEmitter")
+    em.Texture = "rbxasset://textures/particles/smoke_main.dds"
+    em.Rate = 0
+    em.Lifetime = NumberRange.new(0.6, 1.1)
+    em.Speed = NumberRange.new(4, 8)
+    em.SpreadAngle = Vector2.new(12, 12)
+    em.EmissionDirection = Enum.NormalId.Front
+    em.Size = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.6),
+        NumberSequenceKeypoint.new(1, 3),
+    })
+    em.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.3),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    em.LightEmission = 0.6
+    em.Drag = 2
+    em.Rotation = NumberRange.new(0, 360)
+    em.RotSpeed = NumberRange.new(-60, 60)
+    em.Acceleration = Vector3.new(0, 1.5, 0)
+    em.Parent = att
+
+    fumacaAtt, fumacaEm, fumacaTool = att, em, tool
+    return em
+end
+
+Conex[#Conex + 1] = RunService.Heartbeat:Connect(function(dt)
+    if not Config.Fumaca then
+        if fumacaAtt then limparFumaca() end
+        return
+    end
+    if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then return end
+
+    -- clicar dentro do menu não solta fumaça
+    if menuAberto then
+        local m = UserInputService:GetMouseLocation()
+        local pos, tam = main.AbsolutePosition, main.AbsoluteSize
+        if m.X >= pos.X and m.X <= pos.X + tam.X and m.Y >= pos.Y and m.Y <= pos.Y + tam.Y then
+            return
+        end
+    end
+
+    local char = player.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if not tool then return end
+
+    acumuladorFumaca += dt
+    if acumuladorFumaca < 0.06 then return end
+    acumuladorFumaca = 0
+
+    local em = pegarEmissor(tool)
+    if not em then return end
+
+    local cor = Config.FumacaArcoIris and Color3.fromHSV((os.clock() * 0.6) % 1, 1, 1) or Config.FumacaCor
+    em.Color = ColorSequence.new(cor)
+    em:Emit(Config.FumacaQtd)
+end)
+
+-- ---------- fechar o hub por completo ----------
+-- Desliga tudo, devolve o que foi alterado (anti lag, esticar tela), apaga os
+-- desenhos e a janela. Depois disso o hub some até você executar o script de novo.
+local function fecharHub()
+    if hubFechado then return end
+    hubFechado = true
+
+    Config.Ligado = false
+    Config.Chams = false
+    Config.BarraVida = false
+    Config.Esp = false
+    Config.Esticar = false
+    Config.CamFOVAtivo = false
+    Config.Fumaca = false
+    limparFumaca()
+    Config.Shader = false
+    removerShader()
+    restaurarCeu()
+    pcall(function() miraGui:Destroy() end)
+    if camFovOriginal then
+        pcall(function() Workspace.CurrentCamera.FieldOfView = camFovOriginal end)
+        camFovOriginal = nil
+    end
+
+    for _, nome in ipairs({ "AimLockTronco", "VidaTomajack", "EspTomajack", "EsticarTomajack", "CamFovTomajack" }) do
+        pcall(function() RunService:UnbindFromRenderStep(nome) end)
+    end
+
+    for _, c in ipairs(Conex) do
+        pcall(function() c:Disconnect() end)
+    end
+
+    -- devolve o que o anti lag mudou
+    pcall(antiLagEfeitos, false)
+    pcall(antiLagTexturas, false)
+    pcall(antiLagParticulas, false)
+    pcall(antiLagSombras, false)
+    pcall(antiLagQualidade, false)
+
+    -- apaga desenhos
+    if circulo then pcall(function() circulo:Remove() end) end
+    for _, info in pairs(infos) do
+        for _, k in ipairs({ "barraBorda", "barraVida" }) do
+            if info[k] then pcall(function() info[k]:Remove() end) end
+        end
+        if info.esp then
+            for _, d in pairs(info.esp) do
+                pcall(function() d:Remove() end)
+            end
+        end
+    end
+
+    for p in pairs(chams) do
+        removerChams(p)
+    end
+    pcall(function() chamsPasta:Destroy() end)
+    pcall(function() gui:Destroy() end)
+
+    if env.TomajackFechar == fecharHub then
+        env.TomajackFechar = nil
+    end
+end
+
+env.TomajackFechar = fecharHub
+botaoFechar.MouseButton1Click:Connect(fecharHub)
+
+tw(escala, 0.3, { Scale = 1 })
+notificar("Tomajack Hub", "Carregado. RightShift esconde o menu.", 4)
